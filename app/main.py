@@ -1,41 +1,70 @@
-import os, json, asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import os, time, math, threading, requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import redis.asyncio as redis
 
-# Railway/Nixpacks da ci PORT w env:
-PORT = int(os.getenv("PORT", "8080"))
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+API_KEY = os.getenv("APIFOOTBALL_KEY")
+API_BASE = "https://v3.football.api-sports.io"
 
-app = FastAPI(title="BetMind API")
-r = redis.from_url(REDIS_URL, decode_responses=True)
+app = FastAPI()
 
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "BetMind-API"}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+matches = {}
+
+def sigmoid(x): return 1/(1+math.exp(-x))
+
+def compute_scores(stats):
+    # tryby fallback statystyk
+    # (później podłączymy prawdziwe dane xG i momentum)
+    shots = stats.get("shots", 4)
+    sot = stats.get("sot", 2)
+    xg = stats.get("xg", 0.30)
+    corners = stats.get("corners", 2)
+    minute = stats.get("minute", 60)
+    goals = stats.get("goals", 0)
+
+    ghi = sigmoid((shots + (sot*1.5) + (xg*6) + (corners*0.6) + (minute*0.1))/10)*100
+    ngi = sigmoid((shots + sot + xg*10 + corners + goals*1.5 + minute*0.15)/10)*100
+    return round(ghi,1), round(ngi,1)
+
+def fetch_loop():
+    s = requests.Session()
+    s.headers.update({"x-apisports-key": API_KEY})
+    while True:
+        try:
+            data = s.get(f"{API_BASE}/fixtures?live=all", timeout=10).json()["response"]
+            for m in data:
+                fid = str(m["fixture"]["id"])
+                minute = m["fixture"]["status"]["elapsed"] or 0
+                stats = {"minute": minute}
+                ghi, ngi = compute_scores(stats)
+
+                matches[fid] = {
+                    "match_id": fid,
+                    "home": m["teams"]["home"]["name"],
+                    "away": m["teams"]["away"]["name"],
+                    "score": f"{m['goals']['home']}-{m['goals']['away']}",
+                    "minute": minute,
+                    "ghi": ghi,
+                    "ngi": ngi,
+                }
+        except Exception as e:
+            print("error:", e)
+        time.sleep(10)
 
 @app.get("/live")
-async def live(min_ghi: float = 70.0, min_ngi: float = 0.0, limit: int = 50):
-    # Demo/placeholder – czytamy snapy z Redisa jeśli są, inaczej zwracamy pustą listę:
-    items = []
-    if await r.exists("live:index"):
-        ids = await r.zrevrange("live:index", 0, limit-1)
-        for mid in ids:
-            raw = await r.hget("live:match", mid)
-            if raw:
-                items.append(json.loads(raw))
-    return JSONResponse(items)
+def get_live(min_ghi: float = 70, min_ngi: float = 70):
+    result = [m for m in matches.values() if (m["ghi"]>=min_ghi or m["ngi"]>=min_ngi)]
+    result.sort(key=lambda x: x["ngi"], reverse=True)
+    return JSONResponse(result)
 
-@app.websocket("/stream")
-async def stream(ws: WebSocket):
-    await ws.accept()
-    pubsub = r.pubsub()
-    await pubsub.subscribe("stream:ghi")
-    try:
-        async for msg in pubsub.listen():
-            if msg["type"] == "message":
-                await ws.send_text(msg["data"])
-    except WebSocketDisconnect:
-        await pubsub.unsubscribe("stream:ghi")
-    finally:
-        await pubsub.close()
+@app.get("/")
+def root():
+    return {"status": "ok", "matches_cached": len(matches)}
+
+threading.Thread(target=fetch_loop, daemon=True).start()
