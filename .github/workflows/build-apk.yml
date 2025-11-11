@@ -1,0 +1,123 @@
+name: Build Android APK (BetMind)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (empty ok)
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.0"
+          channel: "stable"
+          cache: true
+
+      - name: Create Flutter project
+        run: |
+          flutter create betmind
+          cd betmind
+          # Podmień main.dart na nasz klient z Twoim backendem
+          cat > lib/main.dart << 'DART'
+          import 'package:flutter/material.dart';
+          import 'dart:async';
+          import 'dart:convert';
+          import 'package:http/http.dart' as http;
+
+          const String apiBase = "https://betmind-api-production.up.railway.app";
+
+          void main() => runApp(const BetMindApp());
+
+          class BetMindApp extends StatelessWidget {
+            const BetMindApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'BetMind',
+                theme: ThemeData.dark(useMaterial3: true),
+                home: const LivePage(),
+                debugShowCheckedModeBanner: false,
+              );
+            }
+          }
+
+          class LivePage extends StatefulWidget {
+            const LivePage({super.key});
+            @override
+            State<LivePage> createState() => _LivePageState();
+          }
+
+          class _LivePageState extends State<LivePage> {
+            List matches = [];
+            Timer? timer;
+
+            @override
+            void initState() {
+              super.initState();
+              fetch();
+              timer = Timer.periodic(const Duration(seconds: 8), (_) => fetch());
+            }
+
+            Future<void> fetch() async {
+              try {
+                final res = await http.get(Uri.parse("$apiBase/live"));
+                if (res.statusCode == 200) {
+                  setState(() { matches = json.decode(res.body); });
+                } else {
+                  // pokaż błąd w UI
+                  setState(() { matches = []; });
+                }
+              } catch (_) {
+                setState(() { matches = []; });
+              }
+            }
+
+            @override
+            void dispose() {
+              timer?.cancel();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text("BetMind – LIVE")),
+                body: matches.isEmpty
+                  ? const Center(child: Text("Brak spotkań / czekam na dane..."))
+                  : ListView.builder(
+                      itemCount: matches.length,
+                      itemBuilder: (_, i) {
+                        final m = matches[i];
+                        return ListTile(
+                          title: Text("${m['home']} vs ${m['away']}    ${m['score']}"),
+                          subtitle: Text("min ${m['minute']}   GHI: ${m['ghi']?.toStringAsFixed(0)}   NGI: ${m['ngi']?.toStringAsFixed(0)}"),
+                        );
+                      },
+                    ),
+              );
+            }
+          }
+          DART
+
+      - name: Build debug APK
+        working-directory: betmind
+        run: |
+          flutter pub get
+          flutter build apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetMind-APK-debug
+          path: betmind/build/app/outputs/flutter-apk/app-debug.apk
